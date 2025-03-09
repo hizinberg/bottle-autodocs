@@ -53,7 +53,7 @@ class BottleAutoDocs:
         app.route('/docs', callback=self.get_swagger_ui)
         app.route('/redoc',callback=self.get_redoc_ui)
 
-    def apply(self, callback):
+    def apply(self, callback,route):
         return callback 
 
 
