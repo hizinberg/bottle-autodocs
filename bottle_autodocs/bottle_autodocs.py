@@ -1,11 +1,7 @@
-import inspect
 import json
 from bottle import PluginError, response
 
-
 def unflatten(dictionary):
-    '''helper function for flattening dict'''
-
     resultDict = dict()
     for key, value in dictionary.items():
         parts = key.split(".")
@@ -16,6 +12,40 @@ def unflatten(dictionary):
             d = d[part]
         d[parts[-1]] = value
     return resultDict
+
+def build_openapi_path(builder):
+    """Convert route builder to OpenAPI-compatible path and parameters."""
+    path_parts = []
+    parameters = []
+
+    for part in builder:
+        if part[0] is None:
+            # Static part of the route
+            path_parts.append(part[1])
+        else:
+            # Dynamic part of the route
+            name = part[0]
+            param_type = part[1]
+
+            # Handle callable types (like lambda)
+            if callable(param_type):
+                param_type = 'integer' if param_type.__name__ == '<lambda>' else 'string'
+            elif param_type == str:
+                param_type = 'string'
+            elif param_type == int:
+                param_type = 'integer'
+            else:
+                param_type = 'string'
+
+            path_parts.append(f'{{{name}}}')
+            parameters.append({
+                'name': name,
+                'in': 'path',
+                'required': True,
+                'schema': {'type': param_type}
+            })
+
+    return ''.join(path_parts), parameters
 
 
 class BottleAutoDocs:
@@ -42,7 +72,6 @@ class BottleAutoDocs:
 
     def setup(self, app):
         """Attach plugin to the Bottle app and register hidden documentation routes."""
-
         if self.app is None:
             self.app = app
         elif self.app != app:
@@ -53,67 +82,54 @@ class BottleAutoDocs:
         app.route('/docs', callback=self.get_swagger_ui)
         app.route('/redoc',callback=self.get_redoc_ui)
 
-    def apply(self, callback,route):
+    def apply(self, callback, route):
         return callback 
 
 
     def collect_routes(self):
         """Dynamically fetch all registered routes, including nested subapps, and update OpenAPI spec."""
-
         if not self.app:
             return
 
         def process_routes(app, app_prefix, app_name, processed_apps):
             """Recursively process routes for the given app instance and add them to OpenAPI spec."""
-
             tag_name = app_name.capitalize()
 
             if app in processed_apps:
                 return
             processed_apps.add(app)
 
-            # Process each route under this app
-            for route in app.routes:
-                if route.rule in self.EXCLUDED_ROUTES:
-                    continue 
+            for rule, builder in app.router.builder.items():
+                if rule in self.EXCLUDED_ROUTES:
+                    continue
+                
+                # Extract OpenAPI-compatible path and parameters from builder
+                path, params = build_openapi_path(builder)
 
-                full_rule = (app_prefix.rstrip("/") + "/" + route.rule.lstrip("/")).replace("//", "/")  
-                method = route.method.lower()
+                # Get route object
+                route = next((r for r in app.routes if r.rule == rule), None)
+                if not route:
+                    continue
 
+                method = route.method.lower()  
                 # Fetch summary, description, tags and example schema from route config
                 summary = route.config.get("summary", "No summary")
                 description = route.config.get("description", "No description")
-                tags = route.config.get("tags", [])
-                example_schema =  unflatten( route.config ).get("example_schema", None) 
+                tags = route.config.get("tags", []) or [tag_name]
+                example_schema = unflatten(route.config).get("example_schema", None)
 
-                # If no tags were provided, use the app-specific tag
                 if not tags:
                     tags = [tag_name]
 
-                # Extract parameters
-                sig = inspect.signature(route.callback)
-                params = [
-                    {
-                        "name": param,
-                        "in": "path",
-                        "required": True,
-                        "schema": {"type": "string"}
-                    }
-                    for param in sig.parameters if param not in ["self", "summary"]
-                ]
+                if path not in self.openapi_spec["paths"]:
+                    self.openapi_spec["paths"][path] = {}
 
-                # Ensure the route path exists in OpenAPI spec
-                if full_rule not in self.openapi_spec["paths"]:
-                    self.openapi_spec["paths"][full_rule] = {}
-                
-                response_schema = {
-                    "type": "object"
-                }
+                response_schema = {"type": "object"}
                 if example_schema:
-                    response_schema["example"] =  example_schema 
+                    response_schema["example"] = example_schema
 
-                # Add method details
-                self.openapi_spec["paths"][full_rule][method] = {
+                # Add OpenAPI details
+                self.openapi_spec["paths"][path][method] = {
                     "summary": summary,
                     "description": description,
                     "parameters": params,
@@ -126,14 +142,17 @@ class BottleAutoDocs:
                     }
                 }
 
-            # Process mounted subapps recursively
+                print(f"Registered: {method.upper()} {path}")
+
+
+            # Process nested subapps
             for route in app.routes:
                 if "mountpoint.target" in route.config:
-                    subapp = route.config["mountpoint.target"] 
+                    subapp = route.config["mountpoint.target"]
                     sub_prefix = (app_prefix.rstrip("/") + "/" + route.config["mountpoint.prefix"].strip("/")).rstrip("/")
-                    sub_name = subapp.config.get("name", sub_prefix.strip("/"))  
+                    sub_name = subapp.config.get("name", sub_prefix.strip("/"))
                     
-                    process_routes(subapp, sub_prefix, sub_name, processed_apps)  
+                    process_routes(subapp, sub_prefix, sub_name, processed_apps)
 
         # Get main app name
         main_app_name = self.app.config.get("name", "default")
@@ -144,7 +163,6 @@ class BottleAutoDocs:
 
     def get_openapi_spec(self):
         """Return OpenAPI JSON spec."""
-
         self.collect_routes()  
         response.content_type = 'application/json'
 
@@ -164,7 +182,6 @@ class BottleAutoDocs:
 
     def get_swagger_ui(self):
         """Serve Swagger UI without exposing it in OpenAPI spec."""
-
         return """
         <!DOCTYPE html>
         <html lang="en">
@@ -187,7 +204,6 @@ class BottleAutoDocs:
         """
     def get_redoc_ui(self):
         """Serve Redoc UI for OpenAPI 3.1.0 support."""
-        
         return """
         <!DOCTYPE html>
         <html>
