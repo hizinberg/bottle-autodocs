@@ -1,5 +1,40 @@
 import json
 from bottle import PluginError, response
+import ast
+import inspect
+
+# This function is used to check if a route callback expects a file
+def expects_file_upload(callback):
+    try:
+        source = inspect.getsource(callback)
+        tree = ast.parse(source)
+        
+        files = set()
+        forms = set()
+        
+        for node in ast.walk(tree):
+            # Detect request.files.get('field')
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if (isinstance(node.func.value, ast.Attribute) and
+                    isinstance(node.func.value.value, ast.Name) and
+                    node.func.value.value.id == 'request'):
+
+                    # Check for request.files.get('field')
+                    if node.func.value.attr == 'files' and node.func.attr == 'get':
+                        if node.args and isinstance(node.args[0], ast.Constant):
+                            files.add(node.args[0].value)
+
+                    # Check for request.forms.get('field')
+                    if node.func.value.attr == 'forms' and node.func.attr == 'get':
+                        if node.args and isinstance(node.args[0], ast.Constant):
+                            forms.add(node.args[0].value)
+
+        return files, forms
+    except Exception as e:
+        return set(), set()
+
+
+
 
 def unflatten(dictionary):
     resultDict = dict()
@@ -105,6 +140,8 @@ class BottleAutoDocs:
                 
                 # Extract OpenAPI-compatible path and parameters from builder
                 path, params = build_openapi_path(builder)
+                if app_prefix != '/':
+                    path = app_prefix + path
 
                 # Get route object
                 route = next((r for r in app.routes if r.rule == rule), None)
@@ -142,8 +179,47 @@ class BottleAutoDocs:
                     }
                 }
 
-                print(f"Registered: {method.upper()} {path}")
+                files, forms = expects_file_upload(route.callback)
 
+
+                # If it is a file upload or form data, set up requestBody
+                if files or forms:
+                    if "requestBody" not in self.openapi_spec['paths'][path][method]:
+                        self.openapi_spec['paths'][path][method]["requestBody"] = {
+                            "required": True,
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {},
+                                        "required": []
+                                    }
+                                }
+                            }
+                        }
+
+                    schema = self.openapi_spec['paths'][path][method]['requestBody']['content']['multipart/form-data']['schema']
+
+                    # Add file fields to OpenAPI spec
+                    for file_field in files:
+                        schema['properties'][file_field] = {
+                            "type": "string",
+                            "format": "binary",
+                            "description": f"Upload File as '{file_field}'"
+                        }
+                        if file_field not in schema['required']:
+                            schema['required'].append(file_field)
+
+                    # Add form fields to OpenAPI spec
+                    for form_field in forms:
+                        schema['properties'][form_field] = {
+                            "type": "string",
+                            "description": f"Form field '{form_field}'"
+                        }
+                        if form_field not in schema['required']:
+                            schema['required'].append(form_field)
+
+            
 
             # Process nested subapps
             for route in app.routes:
