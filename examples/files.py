@@ -4,7 +4,7 @@ from bottle_autodocs import bottle_autodocs
 app = Bottle()
 
 
-UPLOAD_PATH = r'\downloads'
+UPLOAD_PATH = r'\downloads' # Make sure this folder exist or change name to a folder that exists
 
 # Install the plugin
 auto_docs = bottle_autodocs.BottleAutoDocs(title="My API", version="1.0.0", description="API Docs File Uploads ")
