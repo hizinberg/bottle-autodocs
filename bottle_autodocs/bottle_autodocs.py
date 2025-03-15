@@ -2,37 +2,62 @@ import json
 from bottle import PluginError, response
 import ast
 import inspect
+import types,dis
 
 # This function is used to check if a route callback expects a file
 def expects_file_upload(callback):
     try:
         source = inspect.getsource(callback)
         tree = ast.parse(source)
-        
         files = set()
         forms = set()
         
         for node in ast.walk(tree):
-            # Detect request.files.get('field')
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if (isinstance(node.func.value, ast.Attribute) and
-                    isinstance(node.func.value.value, ast.Name) and
-                    node.func.value.value.id == 'request'):
-
-                    # Check for request.files.get('field')
-                    if node.func.value.attr == 'files' and node.func.attr == 'get':
+                if isinstance(node.func.value, ast.Attribute) and node.func.value.value.id == 'request':
+                    # Handle both `request.files.get()` and `request.files.getall()`
+                    if node.func.value.attr == 'files' and node.func.attr in ('get', 'getall'):
                         if node.args and isinstance(node.args[0], ast.Constant):
                             files.add(node.args[0].value)
 
-                    # Check for request.forms.get('field')
-                    if node.func.value.attr == 'forms' and node.func.attr == 'get':
+                    # Handle `request.forms.get()`
+                    elif node.func.value.attr == 'forms' and node.func.attr == 'get':
                         if node.args and isinstance(node.args[0], ast.Constant):
                             forms.add(node.args[0].value)
 
         return files, forms
-    except Exception as e:
+    except Exception:
         return set(), set()
 
+def expects_auth(callback):
+    """Detect if the route expects Bearer or Basic authentication."""
+    if not isinstance(callback, types.FunctionType):
+        return None
+    
+    has_bearer = False
+    has_basic = False
+    auth_check = False
+
+    instructions = dis.get_instructions(callback)
+    for instr in instructions:
+        if instr.opname == 'LOAD_ATTR' and instr.argval == 'get_header':
+            auth_check = True
+
+        if auth_check and instr.opname == 'LOAD_CONST' and instr.argval == 'Authorization':
+            auth_check = False  
+            has_bearer = True  
+
+        if instr.opname == 'LOAD_METHOD' and instr.argval == 'startswith':
+            has_bearer = True
+
+        if instr.opname == 'LOAD_ATTR' and instr.argval == 'auth':
+            has_basic = True
+
+    if has_bearer:
+        return 'bearer'
+    if has_basic:
+        return 'basic'
+    return None
 
 
 
@@ -137,87 +162,138 @@ class BottleAutoDocs:
             for rule, builder in app.router.builder.items():
                 if rule in self.EXCLUDED_ROUTES:
                     continue
-                
+
                 # Extract OpenAPI-compatible path and parameters from builder
                 path, params = build_openapi_path(builder)
+
                 if app_prefix != '/':
                     path = app_prefix + path
 
-                # Get route object
-                route = next((r for r in app.routes if r.rule == rule), None)
-                if not route:
+                routes = [r for r in app.routes if r.rule == rule]
+                if not routes:
                     continue
+                
+                for route in routes:
+                    method = route.method.lower()
 
-                method = route.method.lower()  
-                # Fetch summary, description, tags and example schema from route config
-                summary = route.config.get("summary", "No summary")
-                description = route.config.get("description", "No description")
-                tags = route.config.get("tags", []) or [tag_name]
-                example_schema = unflatten(route.config).get("example_schema", None)
+                    # Initialize path and method if missing
+                    if path not in self.openapi_spec["paths"]:
+                        self.openapi_spec["paths"][path] = {}
 
-                if not tags:
-                    tags = [tag_name]
+                    if method not in self.openapi_spec["paths"][path]:
+                        self.openapi_spec["paths"][path][method] = {}
 
-                if path not in self.openapi_spec["paths"]:
-                    self.openapi_spec["paths"][path] = {}
+                    # Fetch summary, description, tags and example schema from route config
+                    summary = route.config.get("summary", "No summary")
+                    description = route.config.get("description", "No description")
+                    tags = route.config.get("tags", []) or [tag_name]
+                    example_schema = unflatten(route.config).get("example_schema", None)
 
-                response_schema = {"type": "object"}
-                if example_schema:
-                    response_schema["example"] = example_schema
+                    response_schema = {"type": "object"}
+                    if example_schema:
+                        response_schema["example"] = example_schema
 
-                # Add OpenAPI details
-                self.openapi_spec["paths"][path][method] = {
-                    "summary": summary,
-                    "description": description,
-                    "parameters": params,
-                    "tags": tags,
-                    "responses": {
-                        "200": {
-                            "description": "Success",
-                            "content": {"application/json": {"schema": response_schema}}
+                    operation = self.openapi_spec["paths"][path][method]
+                    operation.update({
+                        "summary": summary,
+                        "description": description,
+                        "parameters": params,
+                        "tags": tags,
+                        "responses": {
+                            "200": {
+                                "description": "Success",
+                                "content": {"application/json": {"schema": response_schema}}
+                            }
                         }
-                    }
-                }
+                    })
 
-                files, forms = expects_file_upload(route.callback)
+                    # Detect auth and apply security
+                    auth_scheme = expects_auth(route.callback)
+                    security = []
+
+                    if auth_scheme:
+                        if auth_scheme == 'basic':
+                            self.openapi_spec.setdefault("components", {}).setdefault("securitySchemes", {})["BasicAuth"] = {
+                                "type": "http",
+                                "scheme": "basic"
+                            }
+                            security.append({"BasicAuth": []})
+
+                        elif auth_scheme == 'bearer':
+                            self.openapi_spec.setdefault("components", {}).setdefault("securitySchemes", {})["BearerAuth"] = {
+                                "type": "http",
+                                "scheme": "bearer",
+                                "bearerFormat": "JWT"
+                            }
+                            security.append({"BearerAuth": []})
+
+                    # Apply security at route level only if found
+                    if security:
+                        self.openapi_spec["paths"].setdefault(path, {}).setdefault(method, {})["security"] = security
 
 
-                # If it is a file upload or form data, set up requestBody
-                if files or forms:
-                    if "requestBody" not in self.openapi_spec['paths'][path][method]:
-                        self.openapi_spec['paths'][path][method]["requestBody"] = {
-                            "required": True,
-                            "content": {
-                                "multipart/form-data": {
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": {},
-                                        "required": []
+                    self.openapi_spec["paths"][path][method].update({
+                            "summary": summary,
+                            "description": description,
+                            "parameters": params,
+                            "tags": tags,
+                            "responses": {
+                                "200": {
+                                    "description": "Success",
+                                    "content": {"application/json": {"schema": response_schema}}
+                                }
+                            }
+                        })
+
+
+                    files, forms = expects_file_upload(route.callback)
+
+                    # If it is a file upload or form data, set up requestBody
+                    if files or forms:
+                        if "requestBody" not in self.openapi_spec['paths'][path][method]:
+                            self.openapi_spec['paths'][path][method]["requestBody"] = {
+                                "required": True,
+                                "content": {
+                                    "multipart/form-data": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "required": []
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                    schema = self.openapi_spec['paths'][path][method]['requestBody']['content']['multipart/form-data']['schema']
+                        schema = self.openapi_spec['paths'][path][method]['requestBody']['content']['multipart/form-data']['schema']
 
-                    # Add file fields to OpenAPI spec
-                    for file_field in files:
-                        schema['properties'][file_field] = {
-                            "type": "string",
-                            "format": "binary",
-                            "description": f"Upload File as '{file_field}'"
-                        }
-                        if file_field not in schema['required']:
-                            schema['required'].append(file_field)
+                        required_fields = set(schema.get('required', []))
 
-                    # Add form fields to OpenAPI spec
-                    for form_field in forms:
-                        schema['properties'][form_field] = {
-                            "type": "string",
-                            "description": f"Form field '{form_field}'"
-                        }
-                        if form_field not in schema['required']:
-                            schema['required'].append(form_field)
+                        # multiple file uploads
+                        for file_field in files:
+                            is_multiple = 'getall' in route.callback.__code__.co_names
+                            schema['properties'][file_field] = {
+                                "type": "array" if is_multiple else "string",
+                                "items": {"type": "string", "format": "binary"} if is_multiple else None,
+                                "format": "binary" if not is_multiple else None,
+                                "description": f"Upload file(s) as '{file_field}'"
+                            }
+                            required_fields.add(file_field)
+
+                        # Add form fields to OpenAPI spec
+                        for form_field in forms:
+                            schema['properties'][form_field] = {
+                                "type": "string",
+                                "description": f"Form field '{form_field}'"
+                            }
+                            required_fields.add(form_field)
+
+                        # Add example values for form fields
+                        if example_schema:
+                            for key, value in example_schema.items():
+                                if key in schema['properties']:
+                                    schema['properties'][key]['example'] = value
+
+                        schema['required'] = list(required_fields)
 
             
 
@@ -252,7 +328,6 @@ class BottleAutoDocs:
         self.openapi_spec["tags"] = [
             tag for tag in self.openapi_spec["tags"] if tag["name"] in used_tags
         ]
-
         return json.dumps(self.openapi_spec, indent=4)
 
 
